@@ -23,6 +23,7 @@ class FrameEncoder(nn.Module):
         
     def _sort_embeddings(self, embeddings, frame_id):
         # Sort the embeddings by frame_id
+        # TODO: Make it batch-wise
         if frame_id is not None:
             sorted_indices = torch.argsort(frame_id)
             embeddings = embeddings[sorted_indices]
@@ -50,7 +51,9 @@ class FrameEncoder(nn.Module):
         
     def forward_loss(self, embeddings, frame_id):
         embeddings = self._sort_embeddings(embeddings, frame_id)
-        similarity_matrix = self.get_similarity_matrix(embeddings, self.temperature)
+        similarity_matrix_1 = self.get_similarity_matrix(embeddings, self.temperature)
+        similarity_matrix_2 = self.get_similarity_matrix(embeddings.flip(dims=(0,)), self.temperature)
+        similarity_matrix = (similarity_matrix_1 + similarity_matrix_2) / 2
         # Compute cross-entropy loss
         labels = torch.arange(similarity_matrix.size(0)).to(similarity_matrix.device)
         return F.cross_entropy(similarity_matrix, labels)
