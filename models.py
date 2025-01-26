@@ -1,4 +1,5 @@
 import timm
+from einops import rearrange, repeat
 
 import torch
 from torch import nn
@@ -23,48 +24,69 @@ class FrameEncoder(nn.Module):
         
     def _sort_embeddings(self, embeddings, frame_id):
         # Sort the embeddings by frame_id
-        # TODO: Make it batch-wise
         if frame_id is not None:
-            sorted_indices = torch.argsort(frame_id)
-            embeddings = embeddings[sorted_indices]
+            # Get sorted indices for all batches at once
+            _, sorted_indices = torch.sort(frame_id, dim=1)
+            # Expand sorted_indices to match embeddings dimensions
+            sorted_indices = repeat(sorted_indices, 'b n -> b n d', d=embeddings.size(-1))
+            # Use gather to sort embeddings
+            embeddings = torch.gather(embeddings, dim=1, index=sorted_indices)
         return embeddings
         
     def get_similarity_matrix(self, embeddings, temperature):
         # Normalize the embeddings
-        embeddings = F.normalize(embeddings, p=2, dim=1)
-        
+        embeddings = F.normalize(embeddings, p=2, dim=-1)
         # Compute the similarity matrix and scale it by the temperature
-        similarity_matrix = torch.mm(embeddings[:-2], embeddings.t()[:,:-1])
+        similarity_matrix = torch.bmm(
+            embeddings[:,:-2], 
+            embeddings[:,:-1].transpose(1, 2)
+        )
         similarity_matrix /= temperature
-        
         # Create a mask for the lower triangular part and set the lower triangular part to -inf
         mask = torch.tril(torch.ones_like(similarity_matrix), diagonal=-1)
         similarity_matrix = similarity_matrix.masked_fill(mask.bool(), float('-inf'))
-        
         return similarity_matrix
     
     def get_softmax_similarity_matrix(self, x, frame_id):
-        embeddings = self.backbone(x)
+        embeddings = self.forward_backbone(x)
         embeddings = self._sort_embeddings(embeddings, frame_id)
         similarity_matrix = self.get_similarity_matrix(embeddings, self.temperature)
         return F.softmax(similarity_matrix, dim=1)
-        
+    
+    def forward_backbone(self, x, visual_features=False):
+        reshaped = False
+        if x.ndim == 5:
+            B = x.shape[0]
+            x = rearrange(x, 'b n c h w -> (b n) c h w')
+            reshaped = True
+        if visual_features:
+             features = self.backbone.forward_features(x)
+        else:
+            features = self.backbone(x)
+        if reshaped:
+            features = rearrange(features, '(b n) c -> b n c', b=B)
+        return features
+    
     def forward_loss(self, embeddings, frame_id):
         embeddings = self._sort_embeddings(embeddings, frame_id)
         similarity_matrix_1 = self.get_similarity_matrix(embeddings, self.temperature)
-        similarity_matrix_2 = self.get_similarity_matrix(embeddings.flip(dims=(0,)), self.temperature)
+        similarity_matrix_2 = self.get_similarity_matrix(embeddings.flip(dims=(1,)), self.temperature)
         similarity_matrix = (similarity_matrix_1 + similarity_matrix_2) / 2
-        # Compute cross-entropy loss
-        labels = torch.arange(similarity_matrix.size(0)).to(similarity_matrix.device)
-        return F.cross_entropy(similarity_matrix, labels)
+        # Create labels for cross-entropy loss
+        labels = torch.arange(similarity_matrix.size(1)).to(similarity_matrix.device)
+        labels = repeat(labels, 'n -> b n', b=similarity_matrix.size(0))
+        # Reshape similarity matrix and labels to be compatible with cross-entropy loss
+        similarity_matrix = similarity_matrix.reshape(-1, similarity_matrix.size(-1))
+        labels = labels.reshape(-1)
+        return F.cross_entropy(similarity_matrix, labels, reduction='mean')
         
     def forward(self, x, frame_id=None, return_loss=False):
         if return_loss:
-            embeddings = self.backbone(x)
+            embeddings = self.forward_backbone(x)
             loss = self.forward_loss(embeddings, frame_id)
             return embeddings, loss
         else:
-            return self.backbone(x)
+            return self.forward_backbone(x)
     
     @torch.no_grad()
     def get_cls_attention_from_last_layer(self, image):
@@ -87,7 +109,7 @@ class FrameEncoder(nn.Module):
         last_block = self.backbone.blocks[-1].attn
         hook_handle = last_block.register_forward_hook(hook_fn)
 
-        self.backbone.forward_features(image)
+        self.forward_backbone(image, visual_features=True)
 
         hook_handle.remove()
 
