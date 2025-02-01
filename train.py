@@ -64,6 +64,7 @@ def train_one_epoch(args, encoder, dataloader, optimizer, epoch):
 def main(args):
     dataloader = get_dataloaders(args)
     encoder = FrameEncoder()
+    encoder = encoder.to(args.device)
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
 
     output_dir = Path(args.output_dir)
